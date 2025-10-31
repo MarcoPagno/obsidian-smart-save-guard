@@ -1,90 +1,81 @@
 const { Plugin } = require("obsidian");
+const fs = require("fs");
+const path = require("path");
 
-module.exports = class SmartSaveGuardPlugin extends Plugin {
+module.exports = class SmartSaveGuard extends Plugin {
   async onload() {
-    console.log("Smart Save Guard loaded");
+    console.log("SmartSaveGuard loaded");
 
+    this.cacheDir = path.join(this.app.vault.adapter.getBasePath(), ".smart-save-guard");
+    if (!fs.existsSync(this.cacheDir)) fs.mkdirSync(this.cacheDir, { recursive: true });
+
+    this.lastContent = {};
+    this.flushInterval = 4000;
     this.statusEl = this.addStatusBarItem();
     this.statusEl.setText("Idle");
-    this.statusEl.style.fontWeight = "500";
-    this.statusEl.style.marginLeft = "8px";
     this.statusEl.style.color = "var(--text-muted)";
-    this.statusEl.style.transition = "color 0.2s ease";
 
-    this.cache = {};
-    this.lastSaved = {};
-    this.saveDelay = 2000;
-    this.flushInterval = 8000;
-    this.lastEditTime = 0;
+    const updateHandler = () => {
+      this.lastInput = Date.now();
+      this.statusEl.setText("Editing...");
+      this.statusEl.style.color = "var(--text-accent)";
+      this.saveToCache();
+    };
 
-    this.registerEvent(
-      this.app.workspace.on("editor-change", (editor) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) return;
+    this.registerDomEvent(document, "input", updateHandler);
+    this.registerDomEvent(document, "keyup", updateHandler);
+    this.registerDomEvent(document, "change", updateHandler);
 
-        const content = editor.getValue();
-        this.cache[file.path] = content;
-        this.lastEditTime = Date.now();
-        this.statusEl.setText("Editing…");
-        this.statusEl.style.color = "var(--text-accent)";
-
-        clearTimeout(this.saveTimeout);
-        this.saveTimeout = setTimeout(() => this.tryFlush(file), this.saveDelay);
-      })
-    );
-
-    this.flushTimer = setInterval(() => this.flushAll(), this.flushInterval);
-    this.registerInterval(this.flushTimer);
+    this.registerInterval(window.setInterval(() => this.flushCache(), this.flushInterval));
   }
 
-  async tryFlush(file) {
-    const now = Date.now();
-    if (now - this.lastEditTime < this.saveDelay) return;
-
-    const content = this.cache[file.path];
-    if (!content) return;
-
-    try {
-      const current = await this.app.vault.read(file);
-      if (current.trim() !== content.trim()) {
-        await this.app.vault.modify(file, content);
-        this.lastSaved[file.path] = Date.now();
-        console.log(`[SmartSaveGuard] Saved ${file.path} at ${new Date().toLocaleTimeString()}`);
-        this.showSaved();
-      } else {
-        console.log(`[SmartSaveGuard] Skipped save (no changes detected): ${file.path}`);
-      }
-    } catch (e) {
-      console.error(`[SmartSaveGuard] Save error:`, e);
-      this.showError();
-    }
-  }
-
-  async flushAll() {
+  async saveToCache() {
     const file = this.app.workspace.getActiveFile();
-    if (!file || !this.cache[file.path]) return;
-    await this.tryFlush(file);
+    const editor = this.app.workspace.activeEditor?.editor;
+    if (!file || !editor) return;
+
+    const content = editor.getValue();
+    if (this.lastContent[file.path] === content) return;
+
+    this.lastContent[file.path] = content;
+    const cachePath = path.join(this.cacheDir, file.path.replace(/\//g, "_"));
+
+    fs.writeFileSync(cachePath, content, "utf8");
+    console.log(`[SmartSaveGuard] Cached ${file.path}`);
   }
 
-  showSaved() {
-    this.statusEl.setText("Saved ✓");
-    this.statusEl.style.color = "var(--text-success, #4caf50)";
-    setTimeout(() => {
-      this.statusEl.setText("Idle");
-      this.statusEl.style.color = "var(--text-muted)";
-    }, 1500);
-  }
+  async flushCache() {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
 
-  showError() {
-    this.statusEl.setText("Error saving");
-    this.statusEl.style.color = "var(--text-error, #e53935)";
-    setTimeout(() => {
-      this.statusEl.setText("Idle");
-      this.statusEl.style.color = "var(--text-muted)";
-    }, 2000);
-  }
+    const adapter = this.app.vault.adapter;
+    const fullPath = adapter.getFullPath(file.path);
+    const cachePath = path.join(this.cacheDir, file.path.replace(/\//g, "_"));
 
-  onunload() {
-    clearInterval(this.flushTimer);
+    if (!fs.existsSync(cachePath)) return;
+
+    const cachedContent = fs.readFileSync(cachePath, "utf8");
+    const diskContent = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf8") : "";
+
+    if (cachedContent !== diskContent) {
+      this.statusEl.setText("Saving...");
+      this.statusEl.style.color = "var(--text-warning)";
+
+      try {
+        fs.writeFileSync(fullPath, cachedContent, "utf8");
+        console.log(`[SmartSaveGuard] Flushed ${file.path}`);
+        this.statusEl.setText("Saved ✓");
+        this.statusEl.style.color = "var(--text-success)";
+      } catch (e) {
+        console.error(`[SmartSaveGuard] Error saving ${file.path}:`, e);
+        this.statusEl.setText("Error");
+        this.statusEl.style.color = "var(--text-error)";
+      }
+
+      setTimeout(() => {
+        this.statusEl.setText("Idle");
+        this.statusEl.style.color = "var(--text-muted)";
+      }, 1500);
+    }
   }
 };
